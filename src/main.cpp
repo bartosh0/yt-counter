@@ -10,10 +10,35 @@
 
 #include <YoutubeApi.h>
 
+#include <MD_Parola.h>
+#include <MD_MAX72xx.h>
+#include <SPI.h>
+
+#define HARDWARE_TYPE MD_MAX72XX::FC16_HW
+#define MAX_DEVICES 4
+#define CLK_PIN   14  // or SCK
+#define DATA_PIN  13  // or MOSI
+#define CS_PIN    15  // or SS
+
+#define  DEBUG  0
+
+#if  DEBUG
+#define PRINT(s, x) { Serial.print(F(s)); Serial.print(x); }
+#define PRINTS(x) Serial.print(F(x))
+#define PRINTX(x) Serial.println(x, HEX)
+#else
+#define PRINT(s, x)
+#define PRINTS(x)
+#define PRINTX(x)
+#endif
+
+// Hardware SPI connection
+// MD_Parola P = MD_Parola(HARDWARE_TYPE, CS_PIN, MAX_DEVICES);
+MD_Parola P = MD_Parola(HARDWARE_TYPE, DATA_PIN, CLK_PIN, CS_PIN, MAX_DEVICES);
+
 //define your default values here, if there are different values in config.json, they are overwritten.
-char api_token[34] = "YOUR_API_TOKEN";
 char ytApiV3Key[40] = "YOUR_YT_API_KEY";                // YouTube Data API v3 key generated here: https://console.developers.google.com
-char channelId[25] = "UCDecpmkmcVOwqRhgPJTCiug";   // YT channel id
+char channelId[25] = "UCCJhqj2M7sY8vbuid1DjS_g";   // YT channel id
 
 //flag for saving data
 bool shouldSaveConfig = false;
@@ -35,11 +60,15 @@ void setup() {
   Serial.begin(115200);
   Serial.println();
 
+  P.begin();
+  // P.displayClear();
+
   //clean FS, for testing
   //LittleFS.format();
 
   //read configuration from FS json
   Serial.println("mounting FS...");
+  // P.displayScroll("FS...", PA_CENTER, PA_SCROLL_LEFT, 100);
 
   if (LittleFS.begin()) {
     Serial.println("mounted file system");
@@ -67,7 +96,6 @@ void setup() {
         if (json.success()) {
 #endif
           Serial.println("\nparsed json");
-          strcpy(api_token, json["api_token"]);
           strcpy(ytApiV3Key, json["ytApiV3Key"]);
           strcpy(channelId, json["channelId"]);
         } else {
@@ -78,13 +106,13 @@ void setup() {
     }
   } else {
     Serial.println("failed to mount FS");
+    // P.displayScroll("FS error", PA_CENTER, PA_SCROLL_LEFT, 100 );
   }
   //end read
 
   // The extra parameters to be configured (can be either global or just in the setup)
   // After connecting, parameter.getValue() will get you the configured value
   // id/name placeholder/prompt default length
-  WiFiManagerParameter custom_api_token("apikey", "API token", api_token, 32);
   WiFiManagerParameter custom_ytApiV3Key("ytkey", "YouTube API v3 key", ytApiV3Key, 40);
   WiFiManagerParameter custom_channelId("channelid", "YouTube channel id", channelId, 25);
 
@@ -99,7 +127,6 @@ void setup() {
   //wifiManager.setSTAStaticIPConfig(IPAddress(10, 0, 1, 99), IPAddress(10, 0, 1, 1), IPAddress(255, 255, 255, 0));
 
   //add all your parameters here
-  wifiManager.addParameter(&custom_api_token);
   wifiManager.addParameter(&custom_ytApiV3Key);
   wifiManager.addParameter(&custom_channelId);
 
@@ -129,13 +156,12 @@ void setup() {
 
   //if you get here you have connected to the WiFi
   Serial.println("connected...yeey :)");
+  // P.displayScroll("WiFi ok", PA_CENTER, PA_SCROLL_LEFT, 100 );
 
   //read updated parameters
-  strcpy(api_token, custom_api_token.getValue());
   strcpy(ytApiV3Key, custom_ytApiV3Key.getValue());
   strcpy(channelId, custom_channelId.getValue());
   Serial.println("The values in the file are: ");
-  Serial.println("\tapi_token : " + String(api_token));
   Serial.println("\tytApiV3Key : " + String(ytApiV3Key));
   Serial.println("\tchannelId : " + String(channelId));
 
@@ -148,7 +174,6 @@ void setup() {
     DynamicJsonBuffer jsonBuffer;
     JsonObject& json = jsonBuffer.createObject();
 #endif
-    json["api_token"] = api_token;
     json["ytApiV3Key"] = ytApiV3Key;
     json["channelId"] = channelId;
 
@@ -170,6 +195,7 @@ void setup() {
 
   Serial.println("local ip");
   Serial.println(WiFi.localIP());
+  // P.displayScroll(WiFi.localIP().toString().c_str(), PA_CENTER, PA_SCROLL_LEFT, 100 );
   client.setInsecure();
   YoutubeApi api(ytApiV3Key, client);
 }
@@ -179,20 +205,33 @@ void loop() {
 	if(api.getChannelStatistics(channelId)) {
 		Serial.println("\n---------Stats---------");
 
-		Serial.print("Subscriber Count: ");
-		Serial.println(api.channelStats.subscriberCount);
+    Serial.print("Subscriber Count: ");
+    Serial.println(api.channelStats.subscriberCount);
+    String subscriberCount = String(api.channelStats.subscriberCount);
 
 		Serial.print("View Count: ");
 		Serial.println(api.channelStats.viewCount);
+    String viewCount = String(api.channelStats.viewCount);
 
 		Serial.print("Video Count: ");
 		Serial.println(api.channelStats.videoCount);
+    String videoCount = String(api.channelStats.videoCount);
 
 		// Probably not needed :)
 		//Serial.print("hiddenSubscriberCount: ");
 		//Serial.println(api.channelStats.hiddenSubscriberCount);
 
 		Serial.println("------------------------");
+
+    // P.displayScroll(subscriberCount.c_str(), PA_CENTER, PA_SCROLL_LEFT, 0 );
+    // P.displayText("Test", PA_CENTER, 100, 0, PA_SCROLL_LEFT, PA_SCROLL_LEFT);
+
+
+    if (P.displayAnimate()) {
+      P.displayText("Test", PA_CENTER, 100, 0, PA_SCROLL_LEFT, PA_SCROLL_LEFT);
+      P.displayScroll("Test2", PA_CENTER, PA_SCROLL_LEFT, 100);
+      P.displayReset(); // Restart animation when done
+    }
 	}
 	delay(timeBetweenRequests);
 }
