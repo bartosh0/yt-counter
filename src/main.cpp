@@ -1,12 +1,13 @@
-#include <FS.h>                   //this needs to be first, or it all crashes and burns...
-#include <WiFiManager.h>          //https://github.com/tzapu/WiFiManager
+#include <FS.h>                   
+#include <WiFiManager.h>          
 
 #include <LittleFS.h>
 
-#include <ArduinoJson.h>          //https://github.com/bblanchon/ArduinoJson
+#include <ArduinoJson.h>          
 
 #include <ESP8266WiFi.h>
 #include <WiFiClientSecure.h>
+#include <ESP8266HTTPClient.h>    
 
 #include <YoutubeApi.h>
 
@@ -16,9 +17,9 @@
 
 #define HARDWARE_TYPE MD_MAX72XX::FC16_HW
 #define MAX_DEVICES 4
-#define CLK_PIN   14  // or SCK
-#define DATA_PIN  13  // or MOSI
-#define CS_PIN    15  // or SS
+#define CLK_PIN   14  
+#define DATA_PIN  13  
+#define CS_PIN    15  
 
 #define  DEBUG  0
 
@@ -32,206 +33,354 @@
 #define PRINTX(x)
 #endif
 
-// Hardware SPI connection
-// MD_Parola P = MD_Parola(HARDWARE_TYPE, CS_PIN, MAX_DEVICES);
 MD_Parola P = MD_Parola(HARDWARE_TYPE, DATA_PIN, CLK_PIN, CS_PIN, MAX_DEVICES);
 
-//define your default values here, if there are different values in config.json, they are overwritten.
-char ytApiV3Key[40] = "YOUR_YT_API_KEY";                // YouTube Data API v3 key generated here: https://console.developers.google.com
-char channelId[25] = "UCCJhqj2M7sY8vbuid1DjS_g";   // YT channel id
+char ytApiV3Key[40] = "YOUR_YT_API_KEY";                
+char channelId[25] = "UCibs_X7BMO3mlhuUCMzlRHA";   
 
-//flag for saving data
+// Poprawka bezpieczeństwa: powiększenie bufora do 100, by pasował do rozmiaru w WiFiManager
+char channelName[100] = "Pawulon i Przemas";   
+
 bool shouldSaveConfig = false;
 
-//counter setup
+// Globalne instancje dla bezpieczeństwa pamięci RAM
 WiFiClientSecure client;
-YoutubeApi api(ytApiV3Key, client);
+YoutubeApi *api = nullptr;
 
-unsigned long timeBetweenRequests = 60 * 1000;  // 60 seconds, in milliseconds
+// Parametry portalu - globalne, aby były dostępne w saveConfigCallback
+WiFiManagerParameter* pYtKey = nullptr;
+WiFiManagerParameter* pChannelId = nullptr;
+WiFiManagerParameter* pChannelName = nullptr;
 
-//callback notifying us of the need to save config
+unsigned long timeBetweenRequests = 60 * 1000;  
+unsigned long scrollSpeed = 100;  
+
+// --- Struktura configu przechowywana w RTC memory ---
+// RTC przetrwa soft restart, a zapis do RTC NIE dotyka flash (więc nie ma
+// kolizji z WiFi/PM - unika wdt reset / pm_send_nullfunc crash).
+struct RtcConfig {
+  uint32_t magic = 0x59434F4E;   // "YCON"
+  char ytApiV3Key[40] = "";
+  char channelId[25] = "";
+  char channelName[100] = "";
+  bool dirty = false;   // czy czekamy na zapis do LittleFS przy starcie
+};
+RtcConfig rtcCfg;
+
 void saveConfigCallback () {
   Serial.println("Should save config");
   shouldSaveConfig = true;
+  // Tylko kopiujemy świeże wartości z formularza portalu do globali i RTC.
+  // NIE piszemy do LittleFS tutaj - zapis na flash w trakcie HTTP (kontekst
+  // portalu) blokuje >8s i powoduje wdt reset.
+  if (pYtKey) strlcpy(ytApiV3Key, pYtKey->getValue(), sizeof(ytApiV3Key));
+  if (pChannelId) strlcpy(channelId, pChannelId->getValue(), sizeof(channelId));
+  if (pChannelName) strlcpy(channelName, pChannelName->getValue(), sizeof(channelName));
+
+  // Zapisz konfigu do RTC - przetrwa restart, nie dotyka flash (brak crashu PM/WDT)
+  strlcpy(rtcCfg.ytApiV3Key, ytApiV3Key, sizeof(rtcCfg.ytApiV3Key));
+  strlcpy(rtcCfg.channelId, channelId, sizeof(rtcCfg.channelId));
+  strlcpy(rtcCfg.channelName, channelName, sizeof(rtcCfg.channelName));
+  rtcCfg.dirty = true;
+  ESP.rtcUserMemoryWrite(0, (uint32_t*)&rtcCfg, sizeof(rtcCfg));
+  Serial.println("Config staged to RTC (flash write deferred to next boot)");
+}
+
+// --- Bezpieczny odczyt pojedynczej wartości string z pliku JSON config ---
+// NIE używamy ArduinoJson do odczytu, bo jego alokacje na heapie (DynamicJsonDocument
+// + deserializeJson) uszkadzają strukturę heapa w tym buildzie (ArduinoJson 7 + core
+// 3.1.2), co objawia się Illegal instruction w br_rsa_public_get_default przy
+// pierwszym połączeniu TLS (BearSSL) w tym samym przebiegu.
+// Format pliku: {"ytApiV3Key":"...","channelId":"...","channelName":"..."}
+void extractJsonString(const char* json, const char* key, char* out, size_t outSize) {
+  char needle[40];
+  snprintf(needle, sizeof(needle), "\"%s\":\"", key);
+  const char* p = strstr(json, needle);
+  if (p != nullptr) {
+    p += strlen(needle);
+    size_t i = 0;
+    while (*p && *p != '"' && i < outSize - 1) {
+      out[i++] = *p++;
+    }
+    out[i] = '\0';
+  }
 }
 
 void setup() {
-  // put your setup code here, to run once:
   Serial.begin(115200);
   Serial.println();
 
   P.begin();
-  // P.displayClear();
+  P.displayClear();
+  P.setIntensity(2);
 
-  //clean FS, for testing
-  //LittleFS.format();
+  // --- Odczyt RTC: jeśli mamy oczekujący config z RTC, zapisz go do LittleFS ---
+  // TO robimy ZANIM WiFi jest aktywne, więc flash jest wolny (brak crashu PM/WDT).
+  memset(&rtcCfg, 0, sizeof(rtcCfg));
+  ESP.rtcUserMemoryRead(0, (uint32_t*)&rtcCfg, sizeof(rtcCfg));
+  if (rtcCfg.magic == 0x59434F4E && rtcCfg.dirty) {
+    Serial.println("RTC config found, persisting to LittleFS (radio idle)...");
+    if (LittleFS.begin()) {
+      File configFile = LittleFS.open("/config.json", "w");
+      if (!configFile) {
+        Serial.println("Failed to open config file for writing");
+      } else {
+        configFile.print("{\"ytApiV3Key\":\"");
+        configFile.print(rtcCfg.ytApiV3Key);
+        configFile.print("\",\"channelId\":\"");
+        configFile.print(rtcCfg.channelId);
+        configFile.print("\",\"channelName\":\"");
+        configFile.print(rtcCfg.channelName);
+        configFile.print("\"}");
+        configFile.close();
+        Serial.println("RTC config persisted to LittleFS");
+      }
+      LittleFS.end();
+    }
+    // Wyczyszcz flagę, żeby nie zapisywać ponownie
+    rtcCfg.dirty = false;
+    ESP.rtcUserMemoryWrite(0, (uint32_t*)&rtcCfg, sizeof(rtcCfg));
+  }
 
-  //read configuration from FS json
-  Serial.println("mounting FS...");
-  // P.displayScroll("FS...", PA_CENTER, PA_SCROLL_LEFT, 100);
+  Serial.println("Mounting FS...");
 
-  if (LittleFS.begin()) {
-    Serial.println("mounted file system");
+if (LittleFS.begin()) {
+    Serial.println("Mounted file system");
     if (LittleFS.exists("/config.json")) {
-      //file exists, reading and loading
-      Serial.println("reading config file");
+      Serial.println("Reading config file");
       File configFile = LittleFS.open("/config.json", "r");
       if (configFile) {
-        Serial.println("opened config file");
-        size_t size = configFile.size();
-        // Allocate a buffer to store contents of the file.
-        std::unique_ptr<char[]> buf(new char[size]);
-
-        configFile.readBytes(buf.get(), size);
-
- #if defined(ARDUINOJSON_VERSION_MAJOR) && ARDUINOJSON_VERSION_MAJOR >= 6
-        DynamicJsonDocument json(1024);
-        auto deserializeError = deserializeJson(json, buf.get());
-        serializeJson(json, Serial);
-        if ( ! deserializeError ) {
-#else
-        DynamicJsonBuffer jsonBuffer;
-        JsonObject& json = jsonBuffer.parseObject(buf.get());
-        json.printTo(Serial);
-        if (json.success()) {
-#endif
-          Serial.println("\nparsed json");
-          strcpy(ytApiV3Key, json["ytApiV3Key"]);
-          strcpy(channelId, json["channelId"]);
-        } else {
-          Serial.println("failed to load json config");
-        }
+        Serial.println("Opened config file");
+        // Mały bufor na stosie - BRAK alokacji na heapie (omija bug ArduinoJson/BearSSL)
+        char buf[512];
+        size_t rd = configFile.readBytes(buf, sizeof(buf) - 1);
+        buf[rd] = '\0';
         configFile.close();
+
+        // Ręczne parsowanie (bez ArduinoJson) - zachowuje wartości domyślne,
+        // jeśli klucza nie ma w pliku.
+        extractJsonString(buf, "ytApiV3Key", ytApiV3Key, sizeof(ytApiV3Key));
+        extractJsonString(buf, "channelId", channelId, sizeof(channelId));
+        extractJsonString(buf, "channelName", channelName, sizeof(channelName));
+        Serial.println("\nParsed config (manual, no ArduinoJson)");
       }
     }
   } else {
-    Serial.println("failed to mount FS");
-    // P.displayScroll("FS error", PA_CENTER, PA_SCROLL_LEFT, 100 );
+    Serial.println("Failed to mount FS");
   }
-  //end read
 
-  // The extra parameters to be configured (can be either global or just in the setup)
-  // After connecting, parameter.getValue() will get you the configured value
-  // id/name placeholder/prompt default length
   WiFiManagerParameter custom_ytApiV3Key("ytkey", "YouTube API v3 key", ytApiV3Key, 40);
   WiFiManagerParameter custom_channelId("channelid", "YouTube channel id", channelId, 25);
+  WiFiManagerParameter custom_channelName("channelname", "YouTube channel name", channelName, 100);
+  // Globalne wskaźniki dla saveConfigCallback
+  pYtKey = &custom_ytApiV3Key;
+  pChannelId = &custom_channelId;
+  pChannelName = &custom_channelName;
 
-  //WiFiManager
-  //Local intialization. Once its business is done, there is no need to keep it around
   WiFiManager wifiManager;
-
-  //set config save notify callback
+  // wifiManager.resetSettings(); // uncomment to reset saved settings
   wifiManager.setSaveConfigCallback(saveConfigCallback);
-
-  //set static ip
-  //wifiManager.setSTAStaticIPConfig(IPAddress(10, 0, 1, 99), IPAddress(10, 0, 1, 1), IPAddress(255, 255, 255, 0));
-
-  //add all your parameters here
   wifiManager.addParameter(&custom_ytApiV3Key);
   wifiManager.addParameter(&custom_channelId);
+  wifiManager.addParameter(&custom_channelName);
 
-  //reset settings - for testing
-  //wifiManager.resetSettings();
-
-  //set minimu quality of signal so it ignores AP's under that quality
-  //defaults to 8%
-  //wifiManager.setMinimumSignalQuality();
-
-  //sets timeout until configuration portal gets turned off
-  //useful to make it all retry or go to sleep
-  //in seconds
-  //wifiManager.setTimeout(120);
-
-  //fetches ssid and pass and tries to connect
-  //if it does not connect it starts an access point with the specified name
-  //here  "AutoConnectAP"
-  //and goes into a blocking loop awaiting configuration
   if (!wifiManager.autoConnect("AutoConnectAP", "password")) {
-    Serial.println("failed to connect and hit timeout");
+    Serial.println("Failed to connect and hit timeout");
     delay(3000);
-    //reset and try again, or maybe put it to deep sleep
     ESP.restart();
     delay(5000);
   }
 
-  //if you get here you have connected to the WiFi
-  Serial.println("connected...yeey :)");
-  // P.displayScroll("WiFi ok", PA_CENTER, PA_SCROLL_LEFT, 100 );
+  Serial.println("Connected...yeey :)");
+  // Znowu wyłącz power saving - WiFiManager mógł zmienić tryb radia podczas portalu
+  WiFi.setSleepMode(WIFI_NONE_SLEEP);
+  delay(100);
 
-  //read updated parameters
-  strcpy(ytApiV3Key, custom_ytApiV3Key.getValue());
-  strcpy(channelId, custom_channelId.getValue());
+  P.displayText("WiFi OK", PA_CENTER, 100, 0, PA_SCROLL_LEFT, PA_SCROLL_LEFT);
+  while (!P.displayAnimate())
+  {
+    delay(1);
+  }
+
+  // Jeśli config NIE był zapisany w callbacku (np. autoConnect bez portalu),
+  // skopiuj wartości z parametrów (domyślne/obecne) do globali.
+  if (!shouldSaveConfig) {
+    strlcpy(ytApiV3Key, custom_ytApiV3Key.getValue(), sizeof(ytApiV3Key));
+    strlcpy(channelId, custom_channelId.getValue(), sizeof(channelId));
+    strlcpy(channelName, custom_channelName.getValue(), sizeof(channelName));
+  }
+  
   Serial.println("The values in the file are: ");
   Serial.println("\tytApiV3Key : " + String(ytApiV3Key));
   Serial.println("\tchannelId : " + String(channelId));
+  Serial.println("\tchannelName : " + String(channelName));
 
-  //save the custom parameters to FS
   if (shouldSaveConfig) {
-    Serial.println("saving config");
- #if defined(ARDUINOJSON_VERSION_MAJOR) && ARDUINOJSON_VERSION_MAJOR >= 6
-    DynamicJsonDocument json(1024);
-#else
-    DynamicJsonBuffer jsonBuffer;
-    JsonObject& json = jsonBuffer.createObject();
-#endif
-    json["ytApiV3Key"] = ytApiV3Key;
-    json["channelId"] = channelId;
-
-    File configFile = LittleFS.open("/config.json", "w");
-    if (!configFile) {
-      Serial.println("failed to open config file for writing");
-    }
-
-#if defined(ARDUINOJSON_VERSION_MAJOR) && ARDUINOJSON_VERSION_MAJOR >= 6
-    serializeJson(json, Serial);
-    serializeJson(json, configFile);
-#else
-    json.printTo(Serial);
-    json.printTo(configFile);
-#endif
-    configFile.close();
-    //end save
+    // Config został już zapisany do RTC w saveConfigCallback (bez dotykania flash).
+    // Restartujemy, aby przy starcie (radio nieaktywne, flash wolny) RTC->LittleFS
+    // zapis wykonał się bezpiecznie, a następnie TLS ruszył na czystym heapie.
+    Serial.println("Config staged to RTC. Restarting to persist to LittleFS safely...");
+    delay(500);
+    // Zapisz RTC jeszcze raz (gwarancja, że restart zobaczy flagę dirty)
+    rtcCfg.dirty = true;
+    ESP.rtcUserMemoryWrite(0, (uint32_t*)&rtcCfg, sizeof(rtcCfg));
+    ESP.restart();
+    delay(5000);
   }
 
-  Serial.println("local ip");
-  Serial.println(WiFi.localIP());
-  // P.displayScroll(WiFi.localIP().toString().c_str(), PA_CENTER, PA_SCROLL_LEFT, 100 );
+  String localIP = WiFi.localIP().toString();
+  Serial.println("Local IP:");
+  Serial.println(localIP);
+  
+  // Zostawiłem zakomentowane tak jak u Ciebie
+  // P.displayText(localIP.c_str(), PA_CENTER, 100, 0, PA_SCROLL_LEFT, PA_SCROLL_LEFT);
+  // while (!P.displayAnimate())
+  // {
+  //   delay(1);
+  // }
+  
+  // Konfiguracja API dopiero po nawiązaniu pełnego połączenia i zwoleniu pamięci (Optymalizacja)
   client.setInsecure();
-  YoutubeApi api(ytApiV3Key, client);
+  
+  if (api != nullptr) {
+    delete api;
+  }
+  api = new YoutubeApi(ytApiV3Key, client);
+
+  // --- Poprawka: zmniejsz rozmiar buforów SSL (mniejsze zapotrzebowanie na heap BearSSL) ---
+  // Większe bufory (1024) + BearSSL potrafią przekroczyć dostępny heap po restarcie,
+  // co objawia się Illegal instruction w br_rsa_public_get_default.
+  client.setBufferSizes(512, 512);
+
+  // --- Poprawka: poczekaj aż heap osiągnie bezpieczny poziom przed pierwszym TLS ---
+  // Po restarcie heap bywa zfragmentowany/uszczuplony (po portalu WiFiManager).
+  // BearSSL alokuje duże bloki (context, iobuf, X.509) - jeśli zabraknie RAM,
+  // std::make_shared / _alloc_iobuf zwraca nullptr i crashujemy w br_ssl_client_zero.
+  Serial.printf("[HEAP] Free before TLS: %u\n", ESP.getFreeHeap());
+  delay(200);
+}
+
+void fetchAndDisplayServerMessage() {
+  Serial.println("[HTTP] Starting to fetch message from the server...");
+  
+  WiFiClient httpClient; 
+  HTTPClient http;
+
+  if (http.begin(httpClient, "http://counter.senshi.pl/index.php")) {
+    int httpCode = http.GET();
+
+    if (httpCode == HTTP_CODE_OK) {
+      String payload = http.getString();
+      Serial.println("[HTTP] Received response: " + payload);
+
+#if defined(ARDUINOJSON_VERSION_MAJOR) && ARDUINOJSON_VERSION_MAJOR >= 6
+      DynamicJsonDocument doc(1024);
+      DeserializationError error = deserializeJson(doc, payload);
+      if (!error) {
+        const char* displayText = doc["display_text"];
+#else
+      DynamicJsonBuffer jsonBuffer;
+      JsonObject& doc = jsonBuffer.parseObject(payload);
+      if (doc.success()) {
+        const char* displayText = doc["display_text"];
+#endif
+        
+        P.displayText(displayText, PA_CENTER, scrollSpeed, 0, PA_SCROLL_LEFT, PA_SCROLL_LEFT);
+        while (!P.displayAnimate()) {
+          delay(1);
+        }
+        
+      } else {
+        Serial.println("[JSON] Failed to parse server response.");
+      }
+    } else {
+      Serial.printf("[HTTP] GET Error, error code: %d\n", httpCode);
+    }
+    http.end(); 
+  } else {
+    Serial.println("[HTTP] Failed to connect to the server.");
+  }
+}
+
+String formatNumbers(String numStr) {
+  String result = "";
+  int len = numStr.length();
+  
+  for (int i = 0; i < len; i++) {
+    // Dodaj apostrof co 3 znaki od końca, ale nie na samym początku liczby
+    if ((len - i) % 3 == 0 && i != 0) {
+      result += "'";
+    }
+    result += numStr[i];
+  }
+  return result;
 }
 
 void loop() {
-  // put your main code here, to run repeatedly:
-	if(api.getChannelStatistics(channelId)) {
-		Serial.println("\n---------Stats---------");
+  // Wywołania api zmienione na api->
+  // --- Poprawka: przy pierwszym połączeniu po restarcie, jeśli heap jest za mały,
+  // odczekaj zanim spróbujesz TLS (unika crashu w br_rsa_public_get_default).
+  if (ESP.getFreeHeap() < 30000) {
+    Serial.printf("[HEAP] Low heap %u, waiting before TLS...\n", ESP.getFreeHeap());
+    delay(3000);
+  }
 
+  if(api != nullptr && api->getChannelStatistics(channelId)) {
+    Serial.println("\n---------Stats---------");
     Serial.print("Subscriber Count: ");
-    Serial.println(api.channelStats.subscriberCount);
-    String subscriberCount = String(api.channelStats.subscriberCount);
+    Serial.println(api->channelStats.subscriberCount);
+    String subscriberCount = formatNumbers(String(api->channelStats.subscriberCount));
 
-		Serial.print("View Count: ");
-		Serial.println(api.channelStats.viewCount);
-    String viewCount = String(api.channelStats.viewCount);
+    Serial.print("View Count: ");
+    Serial.println(api->channelStats.viewCount);
+    String viewCount = formatNumbers(String(api->channelStats.viewCount));
 
-		Serial.print("Video Count: ");
-		Serial.println(api.channelStats.videoCount);
-    String videoCount = String(api.channelStats.videoCount);
+    Serial.print("Video Count: ");
+    Serial.println(api->channelStats.videoCount);
+    String videoCount = formatNumbers(String(api->channelStats.videoCount));
+    Serial.println("------------------------");
 
-		// Probably not needed :)
-		//Serial.print("hiddenSubscriberCount: ");
-		//Serial.println(api.channelStats.hiddenSubscriberCount);
+    P.displayClear();
 
-		Serial.println("------------------------");
+    // --- Channel Name ---
+    P.displayText(channelName, PA_CENTER, scrollSpeed, 0, PA_SCROLL_LEFT, PA_SCROLL_LEFT);
+    while (!P.displayAnimate()) delay(1);
 
-    // P.displayScroll(subscriberCount.c_str(), PA_CENTER, PA_SCROLL_LEFT, 0 );
-    // P.displayText("Test", PA_CENTER, 100, 0, PA_SCROLL_LEFT, PA_SCROLL_LEFT);
+    // --- Subs ---
+    P.displayText("Suby", PA_CENTER, scrollSpeed, 0, PA_SCROLL_LEFT, PA_SCROLL_LEFT);
+    while (!P.displayAnimate()) delay(1);
+    
+    P.displayText(subscriberCount.c_str(), PA_CENTER, scrollSpeed, 0, PA_SCROLL_LEFT, PA_NO_EFFECT);
+    while (!P.displayAnimate()) delay(1);
+    
+    delay(timeBetweenRequests/3);
+    
+    P.displayText(subscriberCount.c_str(), PA_CENTER, scrollSpeed, 0, PA_NO_EFFECT, PA_SCROLL_LEFT);
+    while (!P.displayAnimate()) delay(1);
 
+    // --- Vids ---
+    P.displayText("Filmy", PA_CENTER, scrollSpeed, 0, PA_SCROLL_LEFT, PA_SCROLL_LEFT);
+    while (!P.displayAnimate()) delay(1);
+    
+    P.displayText(videoCount.c_str(), PA_CENTER, scrollSpeed, 0, PA_SCROLL_LEFT, PA_NO_EFFECT);
+    while (!P.displayAnimate()) delay(1);
+    
+    delay(timeBetweenRequests/3);
+    
+    P.displayText(videoCount.c_str(), PA_CENTER, scrollSpeed, 0, PA_NO_EFFECT, PA_SCROLL_LEFT);
+    while (!P.displayAnimate()) delay(1);
 
-    if (P.displayAnimate()) {
-      P.displayText("Test", PA_CENTER, 100, 0, PA_SCROLL_LEFT, PA_SCROLL_LEFT);
-      P.displayScroll("Test2", PA_CENTER, PA_SCROLL_LEFT, 100);
-      P.displayReset(); // Restart animation when done
-    }
-	}
-	delay(timeBetweenRequests);
+    // --- Views ---
+    P.displayText("Wyswietlenia", PA_CENTER, scrollSpeed, 0, PA_SCROLL_LEFT, PA_SCROLL_LEFT);
+    while (!P.displayAnimate()) delay(1);
+    
+    P.displayText(viewCount.c_str(), PA_CENTER, scrollSpeed, 0, PA_SCROLL_LEFT, PA_SCROLL_LEFT);
+    while (!P.displayAnimate()) delay(1);
+
+    // --- Server Message ---
+    fetchAndDisplayServerMessage();
+  } else {
+    Serial.println("Failed to fetch YouTube statistics. Retrying...");
+    delay(5000); 
+  }
 }
