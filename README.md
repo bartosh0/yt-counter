@@ -103,7 +103,7 @@ Aby całkowicie usunąć zapisane dane i uruchomić konfigurację od początku:
 
 Dane YouTube (klucz API, identyfikator i nazwa kanału) konfigurujesz **w tym samym portalu WiFi** – wystarczy uruchomić go ponownie (sekcja 3) i zmienić odpowiednie pola przed kliknięciem **SAVE**.
 
-- **Klucz API (YouTube API v3 key)** – wymagany do odczytu statystyk. Urządzenie jest wstępnie skonfigurowane, klucz można zmienić na własny z konsoli Google Cloud.
+- **Klucz API (YouTube API v3 key)** – wymagany do odczytu statystyk. **Nie jest wpisany w kodzie** – podajesz go w portalu konfiguracyjnym (sekcja 2.2). Klucz własny wygenerujesz w konsoli Google Cloud (API YouTube Data v3).
 - **Channel id** – identyfikator kanału (najlepiej wziąć z adresu URL kanału: `youtube.com/channel/UC...`).
 - **Channel name** – nazwa wyświetlana na początku cyklu na matrycy.
 

@@ -3,3 +3,6 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+
+# Klucz API YouTube - nie commitować (repo publiczne)
+src/yt api key.txt

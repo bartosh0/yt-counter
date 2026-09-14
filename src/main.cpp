@@ -35,6 +35,9 @@
 
 MD_Parola P = MD_Parola(HARDWARE_TYPE, DATA_PIN, CLK_PIN, CS_PIN, MAX_DEVICES);
 
+// UWAGA: klucz API NIE jest wpisany w kodzie (repo publiczne).
+// Klucz podajesz raz w portalu konfiguracyjnym (WiFiManager) - zostanie
+// zapisany w LittleFS/RTC i przetrwa restart bez dotykania kodu.
 char ytApiV3Key[40] = "YOUR_YT_API_KEY";                
 char channelId[25] = "UCibs_X7BMO3mlhuUCMzlRHA";   
 
